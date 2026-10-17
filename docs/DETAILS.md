@@ -746,6 +746,38 @@ of the arena the warning adds that the whole PC can stall in memory reclaim, and
 one program from taking all of it. The server, before it starts an engine, ends one that an earlier run left behind and now waits up
 to 120 s for it to be gone (it used to wait 10 s): an engine with tens of GB of pinned memory needs longer to give it back, and the
 next one started beside it ran the PC out of RAM (#4051).
+**On disk (`--conversation-cache-disk-mib N`, opt-in).** The parked conversations become session files instead of
+host-RAM copies: N MiB is the whole budget across the files, and while it is on, `--conversation-cache-mib` is
+ignored (the engine says so). A park streams what the save endpoint writes - running state, the deepest checkpoint,
+every layer's K/V including the draft - to a new file in `--conversation-cache-dir` (default: a `conversation_cache`
+folder next to the pack), after which RAM keeps only the token and checkpoint index; the budget counts the file. A
+parked write needs disk room for the whole file plus `--session-min-free-mib`, with an 8 GiB floor, and the host RAM
+admission gate can refuse the write's peak too - then the park is skipped like the other skip-park paths and the
+conversation is simply not parked. The request switch
+restores through the same bounded read and RAM admission as `RESTORE`: reading a conversation back costs a transient
+host-RAM spike of roughly the file's size, and a read that fails in the file itself (parse, checksum, read errors)
+drops the entry and its file and reads the prompt from scratch; a RAM refusal (the admission gate inside the read,
+or a failed allocation) and a limits preflight refusal drop the entry and keep the file for the next start's scan, and
+a snapshot bigger than the whole budget skips the park without writing it. The files carry the same model and
+configuration identity as the session files below. At startup
+the folder is scanned: matching files are indexed oldest-first, so a returning client resumes from its file; files
+from another model or configuration, or unused for `--conversation-cache-days` (default 7), are removed, and `0`
+empties the folder at start (the scan runs only when the disk cache is on). Survivors over the budget are
+evicted oldest-first and their files go with them, so the
+log line `folder ...: N conversation(s) kept from earlier runs` counts what survived. A pinned shared prefix (`pin=N`,
+above) is runtime-only: a restored conversation comes back un-pinned, and the next request pins it again. On QUIT the
+live conversation is parked before the engine exits, so the current chat is there next start; the server gives the
+engine 20 s after
+QUIT before terminating it, so a park that needs longer is simply lost - the file is written under a temporary name
+and renamed once complete, so nothing corrupt is left, and the conversation reads from scratch next start. Images
+are matched by their keys as in RAM mode. With `--layer-split` the disk cache turns off and says so (one file per
+stage is not what this folder cache is); RAM parking continues under `--conversation-cache-mib`. `--batch` and the
+save/restore endpoints are unchanged.
+
+The web page's Monitor tab has a **Conversation cache** card (0.1.39, #596): the parked conversations against the
+slots and the RAM budget, how many were parked, restored and evicted, and the last switch (read from the engine's
+log), and for every setup how many prompt tokens the cache gave back - in the last request and since the start.
+`/metrics` has the same under `"conversation_cache"`.
 
 **When it is still short after the wait: the RAM copy, and `--ram-keep-gib` (R5070).** The arena is used only when it fits. When it does
 not (#4846), the engine does not read every expert through the file any more: with a static expert profile it keeps the hottest experts
@@ -768,7 +800,9 @@ Snapshots hold running state, checkpoints, used K/V pages and draft-layer K/V. T
 are evicted first. A new conversation that starts at a checkpoint inside a parked one (sub-agents that share a system prompt)
 restores that prefix and leaves the parked conversation in place (the log says "borrowed"). Oversized snapshots or host
 allocation failures fall back to ordinary prompt processing. With `--layer-split` a parked conversation holds one image per
-stage. Parked snapshots are not kept across restarts; session files are. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables K/V
+stage. Parked snapshots are not kept across restarts; session files are - and with `--conversation-cache-disk-mib` a
+parked snapshot is one of those session files, so it persists too (the live conversation is parked on a clean exit).
+`STRATA_SNAPSHOT_FULL_CAPTURE=1` disables K/V
 retention for diagnostics. The Monitor tab's **Conversation cache** card shows parked, restored and evicted counts and the
 prompt tokens the cache gave back; `/metrics` has the same under `"conversation_cache"`.
 
