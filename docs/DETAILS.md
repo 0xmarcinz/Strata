@@ -778,6 +778,13 @@ The conversation the engine holds can be saved to a file and restored later, als
 so a long prompt is not read again. Start the server with `--slot-save-path DIR` (or `"slot_save_path"` in the config). The
 file format is Strata's own, not llama.cpp's, and there is no erase action.
 
+A restored conversation resumes at the checkpoint the file holds, and the engine stores one: the deepest *pinned*
+checkpoint when the request carried a pinned shared start (`pin=N`, the server's auto pin), otherwise the deepest turn
+checkpoint. With the auto pin on that is the shared start, so a conversation coming back from disk re-reads everything after
+it (measured at 200K tokens: 22,220 reused of 119,923, 28.7 s). `STRATA_QWEN_AUTO_PIN=0` (`STRATA_DS4_AUTO_PIN=0` on
+DeepSeek) makes the file keep the turn checkpoint instead: the same return reused 119,292 tokens and read 631. The price is
+that a *new* conversation reads its shared start once.
+
 ```bash
 curl -X POST "http://127.0.0.1:8080/slots/0?action=save"    -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
 curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
@@ -847,6 +854,27 @@ until you close the preview. It can still use your CPU, and it is code the model
 
 **Load / Unload** in the header loads the model or frees the GPU (`POST /load`, `POST /unload`). It asks before unloading and is off
 while an answer is being written or an image is made.
+
+**Temperatures and fans.** The Monitor tab reads the machine, not the model. The GPU's temperature and its fan speed come from
+the card's own driver (NVML, or the `amdgpu` files on Linux); the CPU's comes from its own sensor (AMD's `k10temp`, Intel's
+`coretemp`) and each drive's from the kernel's `hwmon` files, where an NVMe drive reports its Composite sensor. A board fan's
+speed and its PWM percentage are there when the motherboard's Super-I/O driver is loaded (`nct6775`, `it87`). A reading the
+machine does not expose is a dash, never an estimate: on Windows and macOS only the GPU's own readings exist, and most machines
+have no board fan driver loaded.
+
+The `fans` key names the board's fan channels, so the Monitor says what each one is instead of `fan4`, and puts the CPU's fan
+beside the CPU's temperature (a name containing "CPU"):
+
+```json
+"fans": { "it8688/fan1": "CPU fan", "it8688/fan2": "Top exhausts (2)",
+          "it8688/fan4": "Bottom intakes (3)", "it8688/fan5": "Back intake" }
+```
+
+A key is `<chip>/<fanN>` from the kernel's `hwmon` files (`/sys/class/hwmon/hwmon*/name` and its `fanN_input`), and the chip
+may be shortened to a prefix, because the kernel appends an address to it (`it8688` matches `it8688_6008090b`). A header whose
+tachometer reads 0 - nothing wired, or a fan without a tach wire - gets no card. The same numbers are in `GET /metrics` under
+`"hardware"` (`cpu_temp`, `drives`, `fans` with `name`, `rpm` and `duty`, `gpu_fan`) and in Prometheus as
+`strata:cpu_temp_celsius`, `strata:drive_temp_celsius`, `strata:board_fan_rpm` and `strata:board_fan_percent`.
 
 **Language.** About > Settings lists the page's languages: English (the default), German, Spanish, Japanese, Korean, Portuguese,
 Russian and Chinese. The Chat view, its settings and the header are translated; Monitor, Images and About are still English. A

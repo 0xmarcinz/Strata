@@ -131,6 +131,7 @@ const METRICS = [
   {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
   {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
   {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
+  {key: "ctemp", label: "CPU temp", icon: "thermometer", unit: "°C", series: "cpu_temp", tone: "warn"},
   {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
   {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
   {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
@@ -165,6 +166,31 @@ function spark(id, values, max) {
 function setMetric(key, value, unit, sub) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
   $(`ms-${key}`).textContent = sub || "";
+}
+// A board fan that is not the CPU's (a top, bottom or front fan of the case) gets a tile of its own, added and
+// removed as the machine's hwmon chips come and go.  A GPU's fans never reach here: they are the card's own reading.
+function fanTiles(fans) {
+  const grid = $("metrics");
+  const want = new Map(fans.map((f) => [`${f.chip}|${f.label}`, f]));
+  const have = new Map([...grid.querySelectorAll("[data-fan]")].map((el) => [el.dataset.fan, el]));
+  for (const [key, el] of have) if (!want.has(key)) el.remove();
+  for (const [key, f] of want) {
+    let el = have.get(key);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "st-card metric-card";
+      el.dataset.fan = key;
+      el.innerHTML = `<div class="st-metric">
+        <span class="st-metric__label">${icon("gauge", "st-icon st-icon--sm")}<span class="fan-name"></span></span>
+        <span class="st-metric__value"><span class="fan-value">–</span><small>rpm</small></span>
+        <span class="st-metric__sub fan-duty"></span></div>`;
+      grid.append(el);
+    }
+    el.querySelector(".fan-name").textContent = f.name || f.label || "Case fan";
+    el.querySelector(".fan-value").textContent = f.rpm == null ? "–" : fmt(f.rpm);
+    el.querySelector(".fan-duty").textContent = f.duty == null ? "" : `${fmt(f.duty)}%`;
+    el.title = `${f.name || f.label} on ${f.chip} ${f.label}${f.duty == null ? "" : ` at ${fmt(f.duty)}% duty`}`;
+  }
 }
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
@@ -368,6 +394,7 @@ function render(m) {
   if (!modelOp && !localLoad && live.queued > 0) setPill("queued", tr("pill.queued", "{n} queued", {n: live.queued}));
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
+  if (tab === "monitor") renderDiskSessions(m.disk_sessions);
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -402,6 +429,40 @@ function renderConvCache(c) {
   $("cc-note").textContent = c.enabled
     ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
     : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+}
+
+// #3565: the disk half - the conversations the server parks as session files (auto_sessions / slot_save_path),
+// which the engine's own conversation cache does not cover.
+function renderDiskSessions(d) {
+  const card = $("ds-card");
+  if (!card) return;
+  card.hidden = !d;                                // an older server sends nothing
+  if (!d) return;
+  $("ds-bars").hidden = !d.enabled || !d.files;
+  $("ds-sum").textContent = d.enabled
+    ? (d.files ? `${fmt(d.files)} file${d.files === 1 ? "" : "s"} · ${gb(d.bytes)} GB` : "no files parked yet")
+    : "off";
+  if (d.enabled && d.files) {
+    const cap = d.max_gb ? d.max_gb * 1073741824 : 0;
+    $("ds-files-text").textContent = d.keep ? `${fmt(d.files)} / ${fmt(d.keep)} kept` : fmt(d.files);
+    $("ds-files-bar").style.width = d.keep ? `${Math.min(100, (100 * d.files) / d.keep)}%` : "0%";
+    $("ds-size-text").textContent = cap ? `${gb(d.bytes)} / ${fmt(d.max_gb)} GB` : `${gb(d.bytes)} GB`;
+    $("ds-size-bar").style.width = cap ? `${Math.min(100, (100 * d.bytes) / cap)}%` : "0%";
+  }
+  const last = d.last_kind ? `${d.last_kind === "saved" ? "Saved" : "Restored"} in ${fmt(d.last_ms || 0, 0)} ms, ${since(d.last_at)}` : null;
+  facts($("ds-facts"), [
+    ["Folder", d.dir || null],
+    ["Parked only past", `${fmt(d.min_tokens)} prompt tokens`],
+    ["Saved / restored", d.saved || d.restored ? `${fmt(d.saved)} / ${fmt(d.restored)} (${gb(d.saved_bytes)} written, ${gb(d.restored_bytes)} read)` : null],
+    ["Newest / oldest", d.newest ? `${since(d.newest)} / ${since(d.oldest)}` : null],
+    ["Last park or restore", last],
+    ["Shared starts", d.prefix_sessions
+      ? `${fmt(d.prefix_files || 0)} file${(d.prefix_files || 0) === 1 ? "" : "s"}${d.prefix_stats && d.prefix_stats.last_kind ? ` · last ${d.prefix_stats.last_kind} ${fmt(d.prefix_stats.last_ms || 0, 0)} ms, ${since(d.prefix_stats.last_at)}` : ""}`
+      : null],
+  ]);
+  $("ds-note").textContent = d.error
+    ? `The folder could not be read: ${d.error}`
+    : "Switching away from a conversation saves it here and switching back restores it instead of re-reading the prompt. Files stay across restarts up to the cap above.";
 }
 
 function renderTotals(t) {
@@ -463,7 +524,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
 
-  // the eight cards
+  // the cards
   // Idle: not the last request's speed (one request is noisy) but the run's average from the server's totals
   // (token-weighted, the same figure the engine's DONE lines and Prometheus report). Live stays live.
   const avgDecode = totals && totals.decode_ms > 0 && totals.output_tokens > 0 ? totals.output_tokens / (totals.decode_ms / 1000) : null;
@@ -489,8 +550,18 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
                   : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : (st.gpu_note ? "not available on Windows AMD yet" : ""));
   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
-            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
+            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`) + (g.fan == null ? "" : ` ${fmt(g.fan)}%`))
+                  : hw.gpu_fan == null ? "" : `fan ${fmt(hw.gpu_fan)}%`);
   spark("sp-temp", h.gpu_temp, 90);
+  // the CPU's own sensor (k10temp/coretemp on Linux, from the kernel's hwmon files); a dash where none is readable.
+  // Its fan belongs here, next to it: the board's tachometer whose label names the CPU.
+  const boardFans = hw.fans || [];
+  const cpuFan = boardFans.find((f) => f.role === "cpu")
+    || boardFans.find((f) => /cpu/i.test(`${f.name || ""} ${f.label} ${f.chip}`));
+  setMetric("ctemp", hw.cpu_temp == null ? null : fmt(hw.cpu_temp), "°C",
+            cpuFan ? `fan ${fmt(cpuFan.rpm)} rpm${cpuFan.duty == null ? "" : ` · ${fmt(cpuFan.duty)}%`}`
+                   : hw.cpu_temp == null ? "no readable sensor" : "");
+  spark("sp-ctemp", h.cpu_temp, 100);
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
@@ -528,6 +599,15 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
   $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
   $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
+  $("ctemp-text").textContent = hw.cpu_temp == null ? "–" : `${fmt(hw.cpu_temp)} °C`;
+  $("ctemp-bar").style.width = hw.cpu_temp == null ? "0%" : `${Math.min(100, hw.cpu_temp)}%`;
+  // the drives and fans the machine exposes: each NVMe/SATA drive's temperature, then the GPU's fans and the board's
+  const driveTemps = (hw.drives || []).map((d) => `${d.name} ${d.temp == null ? "–" : `${fmt(d.temp)}°`}`);
+  $("thermal-text").textContent = driveTemps.join(" · ") || "–";
+  $("thermal-text").title = (hw.drives || []).map((d) => `${d.name}: ${d.model || "drive"} ${d.temp == null ? "–" : `${fmt(d.temp)} °C`}`).join("\n");
+  // a case fan (top, bottom, front) is a tile of its own, once it reports a speed: an unwired header reads 0 rpm and
+  // a tile for every one of those would say nothing.  The CPU's fan sits with the CPU's temperature above, 0 included.
+  fanTiles(boardFans.filter((f) => f !== cpuFan && f.rpm > 0));
 
   // recent requests
   const body = $("req-body");

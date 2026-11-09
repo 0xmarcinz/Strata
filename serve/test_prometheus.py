@@ -96,6 +96,26 @@ class Units(unittest.TestCase):
         self.assertNotIn(("strata:gpu_power_watts", lab + ',gpu="0"'), got)   # not measured: no sample
         self.assertEqual(got[("strata:ram_total_bytes", lab)], 64 << 30)
 
+    def test_strata_cpu_drives_and_fans(self):
+        m = {"engine": {"model": "m", "max_context": 1000},
+             "live": {"state": "idle", "queued": 0}, "totals": {},
+             "hardware": {"gpu_util": 40.0, "gpu_temp": 41.0, "gpu_fan": 0, "cpu_temp": 45.4,
+                          "drives": [{"name": "nvme0n1", "model": "INTEL", "temp": 38.9},
+                                     {"name": "sda", "model": "CT1000", "temp": None}],
+                          "fans": [{"chip": "nct6775", "label": "fan1", "name": "CPU fan", "rpm": 1180, "duty": 45},
+                                   {"chip": "nct6775", "label": "fan2", "name": 'Chassis "1"', "rpm": 820, "duty": None}]}}
+        got = parse(render(m, Latencies().snapshot()))
+        lab = 'model_name="m"'
+        self.assertEqual(got[("strata:cpu_temp_celsius", lab)], 45.4)
+        self.assertEqual(got[("strata:drive_temp_celsius", lab + ',device="nvme0n1"')], 38.9)
+        self.assertNotIn(("strata:drive_temp_celsius", lab + ',device="sda"'), got)   # no reading: no sample
+        self.assertEqual(got[("strata:gpu_fan_percent", lab + ',gpu="0"')], 0)        # a stopped fan is a reading
+        self.assertEqual(got[("strata:board_fan_rpm", lab + ',chip="nct6775",fan="fan1",name="CPU fan"')], 1180)
+        self.assertEqual(got[("strata:board_fan_percent", lab + ',chip="nct6775",fan="fan1",name="CPU fan"')], 45)
+        self.assertEqual(got[("strata:board_fan_rpm", lab + ',chip="nct6775",fan="fan2",name="Chassis \\"1\\""')], 820)
+        self.assertNotIn(("strata:board_fan_percent", lab + ',chip="nct6775",fan="fan2",name="Chassis \\"1\\""'),
+                         got)                                   # no pwm reading: no sample
+
 
 class Endpoint(unittest.TestCase):
     @classmethod

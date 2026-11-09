@@ -74,3 +74,42 @@ restrictive list may reduce draft acceptance. Ordinary MTP was tested. The
 experimental coupled/rejection-sampling combinations and multi-GPU execution
 were not validated in this campaign. There is no startup bias-file option in
 this change: send the field with each request.
+
+## A default ban for every request: `ban_cjk_tokens`
+
+A deployment whose answers never contain Han characters (a Korean or Japanese assistant, for example) can
+ban every token whose surface holds one, instead of asking each client to send the list. `serve/cjk_ban.py`
+builds the map once at server startup from the server's own tokenizer, and the run config turns it on:
+
+```json
+{ "ban_cjk_tokens": true }
+```
+
+The map rides the run config's sampling defaults, which every route merges under a request's own fields, so
+a request can still send its own `logit_bias` and an explicit `{}` clears the ban for that turn. A config
+that already sets a sampling `logit_bias` keeps it and the ban is not installed; the startup line says so.
+Hangul, kana and Latin are left alone; only Han ideographs (Extension A, the Unified block, the
+compatibility block, and Extension B..F) are banned.
+
+The ban is complete for token surfaces - a token can only emit what its surface holds - while a Han
+character spelled out of byte-fallback tokens, which the model does for these characters about never, stays
+possible. It is also model-wide rather than language-aware: a profile that must answer in Chinese cannot
+use it as it stands.
+
+Two costs, both once per request rather than once per token: the engine's command line carries the bias
+string (about 660 KB for a 248,320-token Qwen vocabulary, where 55,328 tokens are Han), and the map has to
+normalize. `serve/logit_bias.py` answers the same map object from its cache after the first call, so a
+second request pays a copy, not a scan. Decode speed with the ban active has not been measured here; the MTP
+note above applies to the ban list as well (the draft model is not biased).
+
+### The NVFP4 fork on Windows
+
+That fork is kept as it is, so `tools/patch_cjk_ban.py` adds the two hook lines to its `serve/server.py` at
+launch and copies `serve/cjk_ban.py` beside it, the way the other fork scripts work. It never replaces the
+fork's `serve/logit_bias.py`; it reports when that copy does not remember a large map between requests,
+because then the 55,000-entry ban is normalized on every call (about 100 ms).
+
+```bat
+"%PYTHON%" "%STRATA_ROOT%\tools\patch_cjk_ban.py" "%FORK_ROOT%\serve\server.py"
+if errorlevel 1 (echo Could not prepare the CJK token ban.& exit /b 32)
+```

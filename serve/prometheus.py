@@ -60,6 +60,11 @@ def _num(v, default=0):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else default
 
 
+def _esc(v) -> str:
+    """A label value: a drive's name, a sensor chip's, as Prometheus quotes them."""
+    return str(v).replace("\\", "\\\\").replace('"', '\\"')
+
+
 def render(m: dict, lat: dict) -> str:
     """The text for one scrape.  `m` is Service.metrics(), `lat` Latencies.snapshot()."""
     model = str((m.get("engine") or {}).get("model") or "strata").replace("\\", "\\\\").replace('"', '\\"')
@@ -147,14 +152,26 @@ def strata(m: dict, out: list, lab: str):
            last.get("decode_tok_s"))
     gpus = hw.get("gpus") or ([{"index": 0, "util": hw.get("gpu_util"), "mem_used": hw.get("gpu_mem_used"),
                                 "mem_total": hw.get("gpu_mem_total"), "temp": hw.get("gpu_temp"),
+                                "fan": hw.get("gpu_fan"),
                                 "power": hw.get("gpu_power")}] if hw.get("gpu_util") is not None else [])
     for name, key, help_ in (("gpu_util", "util", "GPU busy, percent (hardware.gpu_util)."),
                              ("gpu_mem_used_bytes", "mem_used", "GPU memory in use (hardware.gpu_mem_used)."),
                              ("gpu_mem_total_bytes", "mem_total", "GPU memory (hardware.gpu_mem_total)."),
                              ("gpu_temp_celsius", "temp", "GPU temperature (hardware.gpu_temp)."),
+                             ("gpu_fan_percent", "fan", "GPU fan speed, percent (hardware.gpu_fan)."),
                              ("gpu_power_watts", "power", "GPU power draw (hardware.gpu_power).")):
         for g in gpus:                                   # a family's samples together, one per card
             metric(name, "gauge", help_, g.get(key), f',gpu="{g.get("index")}"')
     metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))
+    metric("cpu_temp_celsius", "gauge", "CPU temperature (hardware.cpu_temp).", hw.get("cpu_temp"))
     metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", hw.get("ram_used"))
     metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", hw.get("ram_total"))
+    for d in hw.get("drives") or []:                # one sample per drive whose sensor the kernel exposes
+        metric("drive_temp_celsius", "gauge", "Drive temperature (hardware.drives).", d.get("temp"),
+               f',device="{_esc(d.get("name"))}"')
+    for f in hw.get("fans") or []:                  # the board's own tachometers: a case fan, the CPU's fan
+        labels = (f',chip="{_esc(f.get("chip"))}",fan="{_esc(f.get("label"))}"'
+                  f',name="{_esc(f.get("name") or "")}"')
+        metric("board_fan_rpm", "gauge", "Board or case fan speed (hardware.fans).", f.get("rpm"), labels)
+        metric("board_fan_percent", "gauge", "Board or case fan PWM, percent (hardware.fans duty).", f.get("duty"),
+               labels)

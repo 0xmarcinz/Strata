@@ -36,6 +36,8 @@ td.log
 /run-*.sh
 /strata-*.json
 /strata-*.log
+# auto-session files an `auto_sessions` config parks on disk (tens of GB, never source)
+/strata-sessions/
 /build-strata.bat
 /build-strata-cuda12.bat
 /build-cuda12/
@@ -95,3 +97,6 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+# engine packages unpacked into this folder (setup, strata update, a downloaded package): ~1 GB each
+/engine-*/
+/strata-*.json.bak*

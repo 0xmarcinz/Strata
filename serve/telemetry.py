@@ -105,7 +105,21 @@ class _Nvml:
         tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
         out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
         out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
+        out["fan"] = self._fans()
         return out
+
+    def _fans(self):
+        """The card's fan speeds in percent, one per fan (a card with three reports three): NVML's per-fan reading,
+        else the one speed the older API gives.  None when the card reports none - a passive card, or a driver that
+        has no such call.  A zero is a reading: the card's fans are stopped (their zero-fan idle mode)."""
+        n = self._uint("nvmlDeviceGetNumFans")
+        if n:
+            speeds = [self._uint("nvmlDeviceGetFanSpeed_v2", ctypes.c_uint(i)) for i in range(min(int(n), 8))]
+            speeds = [v for v in speeds if v is not None]
+            if speeds:
+                return speeds
+        one = self._uint("nvmlDeviceGetFanSpeed")
+        return [one] if one is not None else None
 
 
 # ------------------------------------------------------------------------------------------------ AMD (Linux sysfs)
@@ -246,6 +260,9 @@ class _Amd:
             out["power"] = p / 1e6 if p is not None else None
             cap = self._int(os.path.join(self.hwmon, "power1_cap"))
             out["power_limit"] = cap / 1e6 if cap is not None else None
+            # the fan's duty cycle (pwm1, 0-255) as a percentage, so an AMD card reads like an NVIDIA one
+            pwm = self._int(os.path.join(self.hwmon, "pwm1"))
+            out["fan"] = [round(pwm / 255 * 100)] if pwm is not None else None
         out.update(self.link())
         return out
 
@@ -481,6 +498,161 @@ def _cpu_name():
     return sysinfo.processor() or None
 
 
+# --------------------------------------------------------------------------------------- CPU, drives and fans
+# The kernel's hwmon class exposes what the boards and drives measure, one folder per chip: the CPU's own sensor
+# (k10temp on AMD, coretemp on Intel), each NVMe drive's (the nvme driver), and - when the board's Super-I/O driver is
+# loaded (nct6775, it87) - the chassis fans.  Windows and macOS have no such class, so these readings are absent there
+# (the GPU's own come from NVML and Metal); every reader answers None or an empty list rather than a guess.
+HWMON = "/sys/class/hwmon"
+BLOCK = "/sys/block"
+# The CPU's chip and its one number, in preference order: AMD's Tctl is the control value the board regulates on,
+# Intel's "Package id 0" is the whole package.
+CPU_CHIPS = {"k10temp": ("Tctl", "Tdie", "Tccd1"), "zenpower": ("Tdie", "Tctl"),
+             "coretemp": ("Package id 0", "Core 0"), "cpu_thermal": ("",), "soc_thermal": ("",)}
+DRIVE_CHIPS = ("nvme", "drivetemp")          # the nvme driver's own node, and drivetemp for a SATA drive
+GPU_CHIPS = ("amdgpu", "radeon", "nouveau", "nvidia")   # their fans come from the card's reader, not from here
+
+
+def _text(path, default=""):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def _milli(path):
+    """A hwmon *_input file (millidegrees) as a float.  None when it is not there, or not a number."""
+    try:
+        return int(_text(path)) / 1000.0
+    except ValueError:
+        return None
+
+
+def hwmon_chips(root: str = HWMON) -> list:
+    """[(chip name, its folder)] for every sensor chip the kernel exposes, in its own order."""
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        folder = os.path.join(root, n)
+        name = _text(os.path.join(folder, "name"))
+        if name:
+            out.append((name, folder))
+    return out
+
+
+def chip_temps(folder: str, count: int = 8) -> dict:
+    """{label: °C} for one chip's tempN_input files, under the label each one carries ("" when it has none)."""
+    out = {}
+    for i in range(1, count + 1):
+        t = _milli(os.path.join(folder, f"temp{i}_input"))
+        if t is not None:
+            out.setdefault(_text(os.path.join(folder, f"temp{i}_label")), t)
+    return out
+
+
+def cpu_temperature(root: str = HWMON, sensors=None) -> float | None:
+    """The CPU's temperature in °C, or None when this machine has no readable sensor.  Its own chip first
+    (k10temp's Tctl on AMD, coretemp's package sensor on Intel), else the same chips as psutil reports them.  ACPI's
+    thermal zone is not used: on a desktop board it is a case or VRM probe (16.8 °C beside a 45 °C CPU on the machine
+    this was written on), and a wrong number is worse than a dash."""
+    for chip, labels in CPU_CHIPS.items():
+        for name, folder in hwmon_chips(root):
+            if name != chip:
+                continue
+            temps = chip_temps(folder)
+            for label in labels:
+                if label in temps:
+                    return round(temps[label], 1)
+            if temps:                        # another kernel's labels: the chip's first sensor is still its CPU
+                return round(next(iter(temps.values())), 1)
+    if sensors is None and root == HWMON:
+        try:
+            import psutil
+            sensors = psutil.sensors_temperatures() or {}       # the same hwmon files, already parsed
+        except (ImportError, OSError, RuntimeError, AttributeError):
+            sensors = {}
+    for chip, labels in CPU_CHIPS.items():
+        for entry in (sensors or {}).get(chip, []):
+            label = getattr(entry, "label", "") or ""
+            if label in labels or not label:
+                return round(float(entry.current), 1)
+    return None
+
+
+def drive_temperatures(block: str = BLOCK) -> list:
+    """[{"name", "model", "temp"}] for every drive whose temperature the kernel exposes: the nvme driver's hwmon
+    node under the drive, or drivetemp for a SATA one.  A drive with no such node is left out - it has no sensor to
+    read, not an unreadable one.  An NVMe drive's number is its Composite sensor, the one vendors quote."""
+    out = []
+    try:
+        names = sorted(os.listdir(block))
+    except OSError:
+        return out
+    for name in names:
+        if re.match(r"^(loop|ram|zram|dm-|md|sr|fd)", name):        # not a drive a temperature belongs to
+            continue
+        dev = os.path.join(block, name, "device")
+        temps = None
+        # the hwmon node sits under the drive's device: `hwmon1` (the nvme driver) or `hwmon/hwmon1` (drivetemp)
+        folders = []
+        for base in (dev, os.path.join(dev, "hwmon")):
+            try:
+                folders += [os.path.join(base, h) for h in sorted(os.listdir(base)) if h.startswith("hwmon")]
+            except OSError:
+                continue
+        for folder in folders:
+            if _text(os.path.join(folder, "name")) in DRIVE_CHIPS:
+                temps = chip_temps(folder)
+                break
+        if temps is None:
+            continue
+        out.append({"name": name, "model": _text(os.path.join(dev, "model")) or None,
+                    "temp": round(temps.get("Composite") or next(iter(temps.values())), 1) if temps else None})
+    return out
+
+
+def fan_name(names, chip: str, label: str) -> str | None:
+    """The name a config gave one fan ({"it8688/fan1": "CPU fan"}): the chip may be named by its prefix, because the
+    kernel appends an address to it (`it8688_6008090b`).  None when the config names no such fan."""
+    for key, name in (names or {}).items():
+        c, _, f = key.partition("/")
+        if f and f != label:
+            continue
+        if c and (chip == c or chip.startswith(c)):
+            return name
+    return None
+
+
+def fan_speeds(root: str = HWMON, count: int = 8, names=None) -> list:
+    """[{"chip", "label", "name", "rpm", "duty", "role"}] for the fans the kernel exposes through hwmon: the board's
+    Super-I/O chip (nct6775, it87, asus, dell_smm) and the fans wired to it.  `duty` is the channel's PWM in percent
+    (0-255 as the chip reports it, in either mode); `name` is what the config calls it, `role` is "cpu" for the one named
+    as such, so a dashboard can put it beside the CPU's temperature.  A GPU's own fans are not here - its reader reports
+    those per card (percent) with the rest of the card's readings.  [] on a machine without such a driver loaded, which is
+    the common case: nothing is guessed from ACPI."""
+    out = []
+    for chip, folder in hwmon_chips(root):
+        if chip in DRIVE_CHIPS or chip in GPU_CHIPS or chip in CPU_CHIPS or chip == "acpitz":
+            continue
+        for i in range(1, count + 1):
+            text = _text(os.path.join(folder, f"fan{i}_input"))
+            try:
+                rpm = int(text)
+            except ValueError:
+                continue
+            label = _text(os.path.join(folder, f"fan{i}_label")) or f"fan{i}"
+            name = fan_name(names, chip, label)
+            duty = _text(os.path.join(folder, f"pwm{i}"))
+            out.append({"chip": chip, "label": label, "name": name, "rpm": rpm,
+                        "duty": round(int(duty) * 100 / 255) if duty.isdigit() else None,
+                        "role": "cpu" if re.search(r"cpu", f"{name or ''} {label}", re.I) else None})
+    return out
+
+
 class _CpuRamFallback:
     """CPU load and RAM without psutil."""
 
@@ -533,13 +705,15 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, fan_names=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
         PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
-        cards, numbered as HIP numbers them, read from sysfs (#301)."""
+        cards, numbered as HIP numbers them, read from sysfs (#301).  `fan_names`: what the config calls the board's
+        fans ({"it8688/fan1": "CPU fan"}), or a callable returning it, read on every sample."""
         self.extra = extra
+        self.fan_names = fan_names
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
@@ -608,6 +782,9 @@ class Telemetry:
         s = {}
         if self.gpu.ok():
             reads = [(i, g.read()) for i, g in self.gpus]
+            for _, r in reads:                  # a card's fans as one number; the per-card list stays in `gpus`
+                if isinstance(r.get("fan"), list):
+                    r["fan"] = max(r["fan"]) if r["fan"] else None
             g = dict(reads[0][1])
             if len(reads) > 1:
                 def vals(k):
@@ -617,10 +794,12 @@ class Telemetry:
                     g[k] = sum(v) if v else None
                 u = vals("util")
                 g["util"] = sum(u) / len(u) if u else None
-                t = vals("temp")
-                g["temp"] = max(t) if t else None
+                for k in ("temp", "fan"):      # the hottest card's temperature, the fastest card's fan
+                    t = vals(k)
+                    g[k] = max(t) if t else None
                 s["gpus"] = [{"index": i, "name": reader.name(), "util": r.get("util"), "mem_used": r.get("mem_used"),
-                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
+                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "fan": r.get("fan"),
+                              "power": r.get("power")}
                              for (i, r), (_, reader) in zip(reads, self.gpus)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
         if self.ps:
@@ -634,6 +813,11 @@ class Telemetry:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
+        # the CPU, the drives and the board's fans: the kernel's hwmon class (Linux), or None/[] where the machine
+        # exposes none - the dashboard shows a dash rather than a guess
+        s["cpu_temp"] = cpu_temperature()
+        s["drives"] = drive_temperatures()
+        s["fans"] = fan_speeds(names=self.fan_names() if callable(self.fan_names) else self.fan_names)
         if self.extra:
             try:
                 s.update(self.extra())
@@ -666,7 +850,7 @@ class Telemetry:
             with self.lock:
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                          "disk_read_mb", "cpu_temp", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
             self._stop.wait(1.0)

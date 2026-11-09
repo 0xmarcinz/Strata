@@ -28,7 +28,7 @@ def function_source(text: str, name: str) -> str:
 
 def cards_block(text: str) -> str:
     """The lines of renderMonitor that make the Decode and Prefill cards."""
-    start = text.index("  // the eight cards")
+    start = text.index("  // the cards")
     return text[start:text.index('  spark("sp-speed"', start)]
 
 

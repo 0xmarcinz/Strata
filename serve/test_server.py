@@ -5196,6 +5196,8 @@ class AmdTelemetry(unittest.TestCase):
             else:
                 (hw / "power1_input").write_text("120000000\n")
             (hw / "power1_cap").write_text("300000000\n")
+            if minor == 129:                                          # the first card's fan: a duty cycle (0-255)
+                (hw / "pwm1").write_text("128\n")
 
     def test_pcie_link_is_the_narrowest_slowest_hop(self):
         """#1733: the link is the slowest/narrowest hop between the root port and the card; the bottleneck is only
@@ -5236,11 +5238,12 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertTrue(g.ok())
                 self.assertEqual(g.name(), "AMD Radeon AI PRO R9700")
                 self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
-                                            "power": 85.0, "power_limit": 300.0, "pcie_gen": None,
+                                            "power": 85.0, "power_limit": 300.0, "fan": [50], "pcie_gen": None,
                                             "pcie_gen_max": None, "pcie_own_gen": None, "pcie_width": None,
                                             "pcie_path": "0/0"})    # #1733: no PCIe files in this fake tree
                 r = telemetry.gpu_reader(1, amd=True).read()
                 self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
+                self.assertIsNone(r["fan"])                            # a card without a pwm file
                 self.assertEqual(telemetry.free_vram_mib(0, amd=True), 30 << 10)
                 self.assertIsNone(telemetry.free_vram_mib(5, amd=True))
                 t = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True)
@@ -5248,6 +5251,7 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertEqual(t.static["gpu_name"], "AMD Radeon AI PRO R9700 + AMD Radeon AI PRO R9700")
                 self.assertEqual((s["gpu_mem_used"], s["gpu_util"], s["gpu_temp"], s["gpu_power"]),
                                  (8 << 30, 68.0, 64.0, 205.0))
+                self.assertEqual(s["gpu_fan"], 50)                     # the fastest card's fan
         with tempfile.TemporaryDirectory() as d:                    # no amdgpu: nothing, and nothing breaks
             with mock.patch.object(telemetry, "SYSFS", d):
                 self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())

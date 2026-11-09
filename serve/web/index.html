@@ -154,6 +154,9 @@
           <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div>
           <div class="bar-row"><span>GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
           <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="temp-bar" style="width:0%"></div></div>
+          <div class="bar-row"><span>CPU temperature</span><span class="muted" id="ctemp-text">&ndash;</span></div>
+          <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="ctemp-bar" style="width:0%"></div></div>
+          <div class="bar-row"><span>Drive temperatures</span><span class="muted" id="thermal-text">&ndash;</span></div>
         </div>
         <div class="st-card req-card">
           <div class="req-head"><span class="card-title">Recent requests</span>
@@ -179,6 +182,18 @@
         </div>
         <dl class="facts" id="cc-facts"></dl>
         <p class="muted small cc-note" id="cc-note"></p>
+      </div>
+
+      <div class="st-card cc-card" id="ds-card" hidden>
+        <div class="req-head"><span class="card-title">Disk sessions</span><span class="muted small" id="ds-sum"></span></div>
+        <div class="cc-bars" id="ds-bars" hidden>
+          <div><div class="bar-row"><span>Conversation files kept</span><span class="muted" id="ds-files-text">&ndash;</span></div>
+            <div class="st-progress"><div class="st-progress__bar" id="ds-files-bar" style="width:0%"></div></div></div>
+          <div><div class="bar-row"><span>Their space on disk</span><span class="muted" id="ds-size-text">&ndash;</span></div>
+            <div class="st-progress"><div class="st-progress__bar" id="ds-size-bar" style="width:0%"></div></div></div>
+        </div>
+        <dl class="facts" id="ds-facts"></dl>
+        <p class="muted small cc-note" id="ds-note"></p>
       </div>
 
       <div class="st-card mcp-card" id="mcp-card" hidden>
