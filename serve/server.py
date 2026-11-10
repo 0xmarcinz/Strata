@@ -42,6 +42,7 @@ import re
 import select
 import signal
 import socket
+import stat
 import struct
 import shutil
 import subprocess
@@ -946,6 +947,17 @@ def conversation_slots(engine) -> int | None:
             pass
     slots = (getattr(engine, "info", None) or {}).get("conversation_cache_slots")
     return slots if isinstance(slots, int) else None
+
+
+#: An auto session's file: `auto-<16 hex>.bin`, the conversation key (conversation_key) as its name.  The pruner and
+#: the Monitor's Disk sessions card only ever look at names that match this: a file saved by hand through /slots/0,
+#: a temporary file, a directory called `auto-…bin` and anything else in the folder are never deleted or counted.
+AUTO_SESSION_FILE = re.compile(r"auto-[0-9a-f]{16}\.bin\Z")
+#: A file touched this recently may still be being written by the engine (a save is not atomic from here): the age rule
+#: leaves it alone, so a clock that jumped or a save in flight cannot cost the conversation that is on disk right now.
+AUTO_SESSION_SAVE_GRACE = 600.0        # seconds
+#: `auto_sessions_max_age_days` is bounded: a typo such as 100000 must not mean "delete every session".
+AUTO_SESSION_MAX_AGE_LIMIT = 3650.0    # days
 
 
 def conversation_key(messages) -> str | None:
@@ -4765,6 +4777,7 @@ class Service:
         self.auto_sessions_min_tokens = 16000         # conversations below this many prompt tokens are not saved
         self.auto_sessions_keep = 12                  # newest auto-*.bin files kept (0: no count limit)
         self.auto_sessions_max_gb = 100.0             # their total bytes cap (0: no cap)
+        self.auto_sessions_max_age_days = 0.0         # delete auto-*.bin older than this (0: keep them, no age rule)
         # what the Monitor's Disk sessions card shows (the files are otherwise visible only in the log)
         self.auto_stats = {"saved": 0, "restored": 0, "saved_bytes": 0, "restored_bytes": 0,
                            "last_ms": None, "last_kind": None, "last_at": None}
@@ -6346,19 +6359,31 @@ class Service:
         out = {"enabled": bool(self.auto_sessions and self.slot_save_path), "dir": self.slot_save_path,
                "files": 0, "bytes": 0, "oldest": None, "newest": None,
                "min_tokens": int(self.auto_sessions_min_tokens), "keep": int(self.auto_sessions_keep),
-               "max_gb": float(self.auto_sessions_max_gb)}
+               "max_gb": float(self.auto_sessions_max_gb),
+               "max_age_days": float(getattr(self, "auto_sessions_max_age_days", 0.0) or 0),
+               "expired": 0, "expired_bytes": 0}      # what the age rule would delete now (a dry run)
         if out["enabled"]:
             try:
-                files = [e for e in os.scandir(self.slot_save_path)
-                         if e.is_file() and (e.name.startswith("auto-") or e.name.startswith(".auto-"))]
+                with os.scandir(self.slot_save_path) as it:
+                    files = [e for e in it
+                             if e.is_file(follow_symlinks=False)
+                             and (e.name.startswith("auto-") or e.name.startswith(".auto-"))]
                 out["files"] = len(files)
                 if files:
-                    st = [e.stat() for e in files]
+                    st = [e.stat(follow_symlinks=False) for e in files]
                     out["bytes"] = sum(x.st_size for x in st)
                     out["oldest"] = min(x.st_mtime for x in st)
                     out["newest"] = max(x.st_mtime for x in st)
             except OSError as e:
                 out["error"] = e.strerror or str(e)
+            if out["max_age_days"] > 0:                 # the same rule the pruner applies, shown, not applied
+                cutoff = now - out["max_age_days"] * 86400.0
+                recent = now - AUTO_SESSION_SAVE_GRACE
+                protected = self._auto_sessions_protected()
+                expired = [f for f in self._auto_session_files()
+                           if f["mtime"] < cutoff and f["mtime"] <= recent and f["name"] not in protected]
+                out["expired"] = len(expired)
+                out["expired_bytes"] = sum(f["size"] for f in expired)
         out.update({k: v for k, v in (self.auto_stats or {}).items()})
         out["prefix_sessions"] = bool(self.prefix_sessions)
         out["prefix_stats"] = dict(self.prefix_stats or {})
@@ -6464,37 +6489,90 @@ class Service:
         finally:
             self.fifo.release()
 
-    def _auto_session_prune(self):
-        """Keep the newest auto_sessions_keep files and at most auto_sessions_max_gb of them (0: no such limit).
-        Only auto-*.bin files are ever deleted: a file saved by hand through /slots/0 is not touched."""
-        keep = int(self.auto_sessions_keep or 0)
-        cap = int(float(self.auto_sessions_max_gb or 0) * (1 << 30))
+    def _auto_session_files(self) -> list[dict]:
+        """The auto-session files in slot_save_path, newest first, with what the pruner and the Monitor need.
+
+        A file is one of ours only when its name is exactly `auto-<16 hex>.bin` and it is a regular file: a symbolic
+        link is never followed and never listed (the engine writes plain files), a directory, a temporary file and a
+        file saved by hand through /slots/0 are left out, and anything unreadable is skipped rather than guessed.
+        The folder is scanned here and nowhere else, so no name from a request or a page ever reaches a delete."""
+        out = []
+        if not self.slot_save_path:
+            return out
         try:
-            entries = []
             with os.scandir(self.slot_save_path) as it:
                 for e in it:
-                    if e.is_file() and e.name.startswith("auto-") and e.name.endswith(".bin"):
-                        st = e.stat()
-                        entries.append((st.st_mtime, st.st_size, e.path))
-        except OSError as e:
-            print(f"[strata] auto sessions: cannot prune ({e})", flush=True)
-            return
-        entries.sort(reverse=True)                    # newest first
-        total = sum(size for _, size, _ in entries)
-        removed = 0
-        for i in range(len(entries) - 1, -1, -1):     # oldest first
-            beyond_count = keep > 0 and i >= keep     # 0: no count limit
-            over_cap = cap > 0 and total > cap        # 0: no size cap
-            if not (beyond_count or over_cap):
-                break
+                    if not AUTO_SESSION_FILE.match(e.name):
+                        continue
+                    try:
+                        if not e.is_file(follow_symlinks=False):      # a link, a folder or a device: not ours
+                            continue
+                        st = e.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    out.append({"name": e.name, "path": e.path, "mtime": st.st_mtime, "size": st.st_size,
+                                "dev": st.st_dev, "ino": st.st_ino})
+        except OSError as e:                                          # a missing or unreadable folder: nothing to do
+            print(f"[strata] auto sessions: cannot read {self.slot_save_path} ({e.strerror or e})", flush=True)
+            return []
+        out.sort(key=lambda f: f["mtime"], reverse=True)               # newest first
+        return out
+
+    def _auto_sessions_protected(self) -> set:
+        """The files the pruner must never delete: the conversation the engine holds now and this request's own."""
+        keys = ((self.auto_conv or {}).get("key") if isinstance(self.auto_conv, dict) else None,
+                getattr(getattr(self, "auto_tls", None), "key", None))
+        return {f"auto-{k}.bin" for k in keys if isinstance(k, str) and k}
+
+    def _auto_session_prune(self, now: float | None = None) -> dict:
+        """Apply the three limits to the auto-session files: the newest `auto_sessions_keep` are kept, their total
+        stays at or under `auto_sessions_max_gb`, and - when it is set - every file older than
+        `auto_sessions_max_age_days` is deleted.  -> what was removed, for the log and the Monitor.
+
+        Only our own files are ever deleted, and only by a name this process listed itself: there is no pattern, path
+        or age from a request here, no shell and no recursion.  A file that is a link, that is newer than the save
+        grace (it may still be written), that belongs to the conversation the engine holds, or whose inode changed
+        since the scan (something replaced it meanwhile) is skipped, so a race cannot delete the wrong file."""
+        now = time.time() if now is None else float(now)
+        keep = int(self.auto_sessions_keep or 0)
+        cap = int(float(self.auto_sessions_max_gb or 0) * (1 << 30))
+        age_days = float(getattr(self, "auto_sessions_max_age_days", 0.0) or 0)
+        cutoff = now - age_days * 86400.0 if age_days > 0 else None
+        files = self._auto_session_files()
+        protected = self._auto_sessions_protected()
+        recent = now - AUTO_SESSION_SAVE_GRACE
+        total = sum(f["size"] for f in files)
+        removed = freed = 0
+        for i in range(len(files) - 1, -1, -1):                        # oldest first
+            f = files[i]
+            beyond_count = keep > 0 and i >= keep                      # 0: no count limit
+            over_cap = cap > 0 and total > cap                         # 0: no size cap
+            too_old = cutoff is not None and f["mtime"] < cutoff
+            if not (beyond_count or over_cap or too_old):
+                if cutoff is None or f["mtime"] >= cutoff:
+                    break                                              # nothing older than this one is a candidate
+                continue
+            if f["name"] in protected or f["mtime"] > recent:           # the held conversation, or a save in flight
+                continue
             try:
-                os.unlink(entries[i][2])
-                total -= entries[i][1]
-                removed += 1
-            except OSError:
-                break
+                st = os.stat(f["path"], follow_symlinks=False)
+                if (st.st_dev, st.st_ino) != (f["dev"], f["ino"]) or not stat.S_ISREG(st.st_mode):
+                    continue                                           # replaced or no longer a regular file
+                os.unlink(f["path"])
+            except OSError as e:                                        # one bad file must not stop the sweep
+                print(f"[strata] auto sessions: cannot delete {f['name']} ({e.strerror or e})", flush=True)
+                continue
+            total -= f["size"]
+            removed += 1
+            freed += f["size"]
         if removed:
-            print(f"[strata] auto sessions: pruned {removed} file(s), {total / 1e9:.1f} GB kept", flush=True)
+            why = []
+            if cutoff is not None:
+                why.append(f"older than {age_days:g} day(s)")
+            print(f"[strata] auto sessions: pruned {removed} file(s), {freed / 1e9:.1f} GB freed"
+                  f"{' (' + ', '.join(why) + ')' if why else ''}, {total / 1e9:.1f} GB kept", flush=True)
+        self._disk_cache = (0.0, None)                                  # the Monitor's card rescans next time
+        return {"removed": removed, "freed": freed, "kept": total, "files": len(files) - removed}
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
             declared_only=False, deferred=False) -> Iterator[tuple[str, object]]:
@@ -10698,6 +10776,13 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     v = cfg.get("auto_sessions_max_gb")
     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
         raise SystemExit(f"[strata] config auto_sessions_max_gb must be a number of GB (0: no cap), not {v!r}")
+    v = cfg.get("auto_sessions_max_age_days")
+    if v is not None:
+        age = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else float("nan")
+        if not math.isfinite(age) or age < 0 or age > AUTO_SESSION_MAX_AGE_LIMIT:
+            raise SystemExit(f"[strata] config auto_sessions_max_age_days must be a number of days from 0 "
+                             f"(0: keep every session until the count or size limit) to {AUTO_SESSION_MAX_AGE_LIMIT:g}, "
+                             f"not {v!r}")
     auto = cfg.get("auto_sessions")
     if auto is not None and not isinstance(auto, bool):
         raise SystemExit(f"[strata] config auto_sessions must be true or false, not {auto!r}")
@@ -10717,13 +10802,16 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         svc.auto_sessions_keep = int(cfg["auto_sessions_keep"])
     if cfg.get("auto_sessions_max_gb") is not None:
         svc.auto_sessions_max_gb = float(cfg["auto_sessions_max_gb"])
+    if cfg.get("auto_sessions_max_age_days") is not None:
+        svc.auto_sessions_max_age_days = float(cfg["auto_sessions_max_age_days"])
     if auto is True:
         if not svc.slot_save_path:
             print("[strata] auto_sessions is on, but slot_save_path is not set: auto sessions stay off", flush=True)
         else:
             svc.auto_sessions = True
             print(f"[strata] auto sessions on: keep {svc.auto_sessions_keep} files, at most "
-                  f"{svc.auto_sessions_max_gb:g} GB, from {svc.auto_sessions_min_tokens} prompt tokens "
+                  f"{svc.auto_sessions_max_gb:g} GB, from {svc.auto_sessions_min_tokens} prompt tokens"
+                  f"{' and delete any older than ' + format(svc.auto_sessions_max_age_days, 'g') + ' day(s)' if svc.auto_sessions_max_age_days else ''} "
                   f"(auto-*.bin in {svc.slot_save_path})", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):

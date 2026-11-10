@@ -455,6 +455,8 @@ function renderDiskSessions(d) {
     ["Parked only past", `${fmt(d.min_tokens)} prompt tokens`],
     ["Saved / restored", d.saved || d.restored ? `${fmt(d.saved)} / ${fmt(d.restored)} (${gb(d.saved_bytes)} written, ${gb(d.restored_bytes)} read)` : null],
     ["Newest / oldest", d.newest ? `${since(d.newest)} / ${since(d.oldest)}` : null],
+    // the age rule (auto_sessions_max_age_days): what the server deletes by itself, and what it would delete now
+    ["Delete older than", d.max_age_days ? `${fmt(d.max_age_days, d.max_age_days < 10 ? 1 : 0)} day${d.max_age_days === 1 ? "" : "s"}${d.expired ? ` \u00b7 ${fmt(d.expired)} file${d.expired === 1 ? "" : "s"} (${gb(d.expired_bytes)} GB) ready to go` : ""}` : null],
     ["Last park or restore", last],
     ["Shared starts", d.prefix_sessions
       ? `${fmt(d.prefix_files || 0)} file${(d.prefix_files || 0) === 1 ? "" : "s"}${d.prefix_stats && d.prefix_stats.last_kind ? ` · last ${d.prefix_stats.last_kind} ${fmt(d.prefix_stats.last_ms || 0, 0)} ms, ${since(d.prefix_stats.last_at)}` : ""}`
@@ -462,7 +464,10 @@ function renderDiskSessions(d) {
   ]);
   $("ds-note").textContent = d.error
     ? `The folder could not be read: ${d.error}`
-    : "Switching away from a conversation saves it here and switching back restores it instead of re-reading the prompt. Files stay across restarts up to the cap above.";
+    : (d.max_age_days
+       ? `Conversations older than ${fmt(d.max_age_days, d.max_age_days < 10 ? 1 : 0)} day(s) are deleted by the server itself, and never the one it is holding now. `
+       : "")
+      + "Switching away from a conversation saves it here and switching back restores it instead of re-reading the prompt. Files stay across restarts up to the cap above.";
 }
 
 function renderTotals(t) {

@@ -504,6 +504,7 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `api_monitor` | off | Records requests for `/api-monitor`. |
 | `lazy_load` | off | Start without loading the model. |
 | `slot_save_path` | none | Enables session files. |
+| `auto_sessions_max_age_days` | `0` | Auto-session files (`auto-*.bin`) older than this many days are deleted by the server itself (`0` keeps them until the count or size limit; at most 3650). A file written in the last 10 minutes, the conversation the engine holds and anything not named `auto-<16 hex>.bin` are never deleted. See [Session files](#session-files-disk). |
 | `host`, `api_key`, `cors_origins`, `trusted_origins`, `allowed_hosts` | local only | See [Network access](#network-access). |
 | `codex_thread_titles`, `codex_compaction_cache` | off | See [Codex CLI](#the-responses-api-and-codex-cli). |
 | `mcp_servers`, `mcp` | none | See [Tools from MCP servers](#tools-from-mcp-servers). |
@@ -814,6 +815,15 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
 - Not supported with `--layer-split`, `--peer-device`, `--batch` or `--prompt-cache 0`. The engine has been run on Linux and CUDA
   only for this feature. Exact token replay across restarts is not guaranteed: expert residency and CPU/GPU rounding can
   change later output.
+- **Age limit (opt-in):** `"auto_sessions_max_age_days": 1` in the config deletes the parked conversations older than
+  that, once per prune alongside the count and size limits. Only files named exactly `auto-<16 hex>.bin` are ever
+  deleted, and only ones this server listed itself: no path or pattern comes from a request or a page, nothing is
+  recursive, and no shell is involved. A symbolic link is never followed or deleted, a directory or a temporary file
+  with that name is left alone, a file touched in the last 10 minutes is skipped (a save may be in flight, and a clock
+  that jumped cannot cost it), and the conversation the engine holds now, and the one the current request belongs to,
+  are kept. A file that is replaced between the scan and the delete (its inode no longer matches) is skipped too. Each
+  prune prints one summary line with how many files went and how much was freed. The Monitor's Disk sessions card
+  shows the limit and how many files would go: `max_age_days`, `expired` and `expired_bytes` in `GET /metrics`.
 
 ### The web page (Chat, Images, Monitor, About)
 
