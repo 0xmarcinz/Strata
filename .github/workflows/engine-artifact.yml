@@ -24,6 +24,9 @@ on:
         required: false
         default: "1"
 
+permissions:
+  contents: write
+
 env:
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 3G
@@ -74,6 +77,20 @@ jobs:
           sh packaging/build_cuda_linux.sh 2>&1 | tee build.log
 
       - name: Keep the build log
+        if: always()
+        run: |
+          [ -f build.log ] || exit 0
+          d=$(mktemp -d)
+          cp build.log "$d/"
+          cd "$d"
+          git init -q
+          git checkout -q -b ci-log
+          git -c user.email=ci@users.noreply.github.com -c user.name=ci add -A
+          git -c user.email=ci@users.noreply.github.com -c user.name=ci commit -q -m "build log of ${GITHUB_SHA}"
+          # the log of the last run, on its own branch, so it can be read without a login
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" ci-log
+
+      - name: Keep the build log as an artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
