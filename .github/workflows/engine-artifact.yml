@@ -61,6 +61,7 @@ jobs:
           restore-keys: ccache-engine-${{ inputs.archs || '120' }}-
 
       - name: Build (the release flags, one arch)
+        shell: bash
         env:
           VARIANT: cuda13
           ARCHS: ${{ inputs.archs || '120' }}
@@ -68,7 +69,18 @@ jobs:
           STRATA_CMAKE_EXTRA: >-
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
-        run: packaging/build_cuda_linux.sh
+        run: |
+          set -o pipefail
+          sh packaging/build_cuda_linux.sh 2>&1 | tee build.log
+
+      - name: Keep the build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Collect the binaries
         run: |
