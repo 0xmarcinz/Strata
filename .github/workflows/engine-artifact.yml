@@ -77,7 +77,8 @@ jobs:
           sh packaging/build_cuda_linux.sh 2>&1 | tee build.log
 
       - name: Keep the build log
-        if: always()
+        if: failure()
+        continue-on-error: true
         run: |
           [ -f build.log ] || exit 0
           d=$(mktemp -d)

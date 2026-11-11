@@ -228,6 +228,8 @@ bool conversation_covers(const ConversationCheckpoint& c, const std::vector<Toke
         if (j == images.size() || !(images[j++] == image)) return false;
     }
     return j == images.size();
+}
+
 /// The matching index of a conversation without its state: ids/imgs/used/pinned of live and of each checkpoint,
 /// cvec and the geometry / layer range; empty state vectors, empty K/V, no stage parts.
 inline SavedConversation conversation_meta_only(const SavedConversation& s) {

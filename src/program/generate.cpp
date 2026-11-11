@@ -16689,6 +16689,7 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: conversation cache: could not return the skipped snapshot\n");
                     err.clear();
                 }
+            }
             // A disk read that validated nothing usable: its entry left the cache with the read, so its file goes here
             // (the RAM path's discarded snapshot is dropped the same way).
             if (!incoming && !disk_incoming_path.empty()) {
@@ -16892,8 +16893,9 @@ int main(int argc, char** argv) {
                              (long long) resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.borrowed());
             }
+            // the restore's clock: the bookkeeping below reports it for a RAM restore and a streamed one alike
+            const auto t0 = Clock::now();
             if (incoming) {
-                const auto t0 = Clock::now();
                 if (!disk_incoming_path.empty()) {
                     // the streaming restore: the K/V file -> staging -> device pools, then the running state.
                     // The sinks capture the pool pointers as they are NOW: built after kvg_ensure above, and nothing
@@ -16968,6 +16970,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR restoring parked conversation: %s\n", err.c_str());
                     return 1;
                 }
+                }
                 if (incoming) {   // the bookkeeping below runs for a RAM restore and for a streamed one alike
                     for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
                         const strata::core::OnDevice on(stages[i]->dev);
@@ -16995,11 +16998,6 @@ int main(int argc, char** argv) {
                                      mtp.kv_state().kv_mode, "ram",
                                      (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
                     }
-                    std::fprintf(stderr, "strata serve: SNAPSHOT_VERIFY draft=%016llx cells=%lld mode=%d source=%s resident=%lld\n",
-                                 (unsigned long long) draft_hash, (long long) draft_kv.cells,
-                                 mtp.kv_state().kv_mode, "ram",
-                                 (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
-                }
                 live = std::move(incoming->live.ids);
                 live_imgs = std::move(incoming->live.imgs);
                 if (stages.empty()) {

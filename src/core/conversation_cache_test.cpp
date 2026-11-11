@@ -746,6 +746,7 @@ int main() {
         // what drop_superseded does with the slot's chain (the park this rule prevents): the root goes
         check(cache.drop_superseded(slot_ids, {}, slot_chain, true) == 1 && cache.size() == 0,
               "the slot's chain supersedes the richer copy");
+    }
     {   // disk mode: budget counts file bytes, eviction removes entries (caller deletes files via at())
         ConversationCache c(1000, 2);
         c.enable_disk();
