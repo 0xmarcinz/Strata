@@ -1,0 +1,89 @@
+name: Engine artifact (CUDA 13, sm_120)
+
+# A downloadable engine build of this branch, for testing a change on one card without building on the
+# machine that serves. Same flags as the release package (packaging/build_cuda_linux.sh, VARIANT=cuda13),
+# but only the arch of the target card, which keeps the build and the artifact small. Nothing is signed:
+# this is a test build, not a release.
+#
+# Run it by hand: Actions > "Engine artifact (CUDA 13, sm_120)" > Run workflow.
+# The artifact holds strata, strata-vision, libstrata_kq.so and BUILD.json. Unpack it into a copy of a
+# release engine folder so the CUDA libraries beside it still resolve, then point the run config's "exe",
+# "lib_dirs" and "vision.exe" at it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: "CUDA architectures (real machine code; a virtual PTX entry is added for the last one)"
+        required: false
+        default: "120"
+      vision:
+        description: "Build the picture reader too (BUILD_VISION=1)"
+        required: false
+        default: "1"
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 3G
+
+jobs:
+  engine:
+    name: CUDA 13.0 engine (${{ inputs.archs }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    container: nvidia/cuda:13.0.2-devel-ubuntu24.04
+    steps:
+      - name: Tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates cmake ninja-build python3 ccache
+          nvcc --version | tail -2
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: llama.cpp (ggml) at the pinned commit
+        run: |
+          commit=$(sed -n 's/^LLAMA_CPP_COMMIT = "\(.*\)"/\1/p' setup.py)
+          mkdir -p third_party/llama.cpp && cd third_party/llama.cpp
+          git init -q
+          git remote add origin https://github.com/ggml-org/llama.cpp.git
+          git fetch -q --depth 1 origin "$commit" && git checkout -q FETCH_HEAD
+
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-engine-${{ inputs.archs }}-${{ hashFiles('CMakeLists.txt', 'src/**', 'include/**', 'cmake/**') }}
+          restore-keys: ccache-engine-${{ inputs.archs }}-
+
+      - name: Build (the release flags, one arch)
+        env:
+          VARIANT: cuda13
+          ARCHS: ${{ inputs.archs }}
+          BUILD_VISION: ${{ inputs.vision }}
+          STRATA_CMAKE_EXTRA: >-
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+        run: packaging/build_cuda_linux.sh
+
+      - name: Collect the binaries
+        run: |
+          set -eu
+          out=$(ls -d out-engine-cuda13/*/ | head -1)
+          echo "package: $out"
+          mkdir -p artifact
+          cp "$out/strata" "$out/BUILD.json" artifact/
+          cp "$out/libstrata_kq.so" artifact/ 2>/dev/null || true
+          cp "$out/strata-vision" artifact/ 2>/dev/null || true
+          ( cd artifact && sha256sum * > SHA256SUMS.txt )
+          cat artifact/BUILD.json
+          du -sh artifact
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: strata-engine-cuda13-sm${{ inputs.archs }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 14
