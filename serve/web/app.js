@@ -394,7 +394,6 @@ function render(m) {
   if (!modelOp && !localLoad && live.queued > 0) setPill("queued", tr("pill.queued", "{n} queued", {n: live.queued}));
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
-  if (tab === "monitor") renderDiskSessions(m.disk_sessions);
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -431,44 +430,6 @@ function renderConvCache(c) {
     : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
 }
 
-// #3565: the disk half - the conversations the server parks as session files (auto_sessions / slot_save_path),
-// which the engine's own conversation cache does not cover.
-function renderDiskSessions(d) {
-  const card = $("ds-card");
-  if (!card) return;
-  card.hidden = !d;                                // an older server sends nothing
-  if (!d) return;
-  $("ds-bars").hidden = !d.enabled || !d.files;
-  $("ds-sum").textContent = d.enabled
-    ? (d.files ? `${fmt(d.files)} file${d.files === 1 ? "" : "s"} · ${gb(d.bytes)} GB` : "no files parked yet")
-    : "off";
-  if (d.enabled && d.files) {
-    const cap = d.max_gb ? d.max_gb * 1073741824 : 0;
-    $("ds-files-text").textContent = d.keep ? `${fmt(d.files)} / ${fmt(d.keep)} kept` : fmt(d.files);
-    $("ds-files-bar").style.width = d.keep ? `${Math.min(100, (100 * d.files) / d.keep)}%` : "0%";
-    $("ds-size-text").textContent = cap ? `${gb(d.bytes)} / ${fmt(d.max_gb)} GB` : `${gb(d.bytes)} GB`;
-    $("ds-size-bar").style.width = cap ? `${Math.min(100, (100 * d.bytes) / cap)}%` : "0%";
-  }
-  const last = d.last_kind ? `${d.last_kind === "saved" ? "Saved" : "Restored"} in ${fmt(d.last_ms || 0, 0)} ms, ${since(d.last_at)}` : null;
-  facts($("ds-facts"), [
-    ["Folder", d.dir || null],
-    ["Parked only past", `${fmt(d.min_tokens)} prompt tokens`],
-    ["Saved / restored", d.saved || d.restored ? `${fmt(d.saved)} / ${fmt(d.restored)} (${gb(d.saved_bytes)} written, ${gb(d.restored_bytes)} read)` : null],
-    ["Newest / oldest", d.newest ? `${since(d.newest)} / ${since(d.oldest)}` : null],
-    // the age rule (auto_sessions_max_age_days): what the server deletes by itself, and what it would delete now
-    ["Delete older than", d.max_age_days ? `${fmt(d.max_age_days, d.max_age_days < 10 ? 1 : 0)} day${d.max_age_days === 1 ? "" : "s"}${d.expired ? ` \u00b7 ${fmt(d.expired)} file${d.expired === 1 ? "" : "s"} (${gb(d.expired_bytes)} GB) ready to go` : ""}` : null],
-    ["Last park or restore", last],
-    ["Shared starts", d.prefix_sessions
-      ? `${fmt(d.prefix_files || 0)} file${(d.prefix_files || 0) === 1 ? "" : "s"}${d.prefix_stats && d.prefix_stats.last_kind ? ` · last ${d.prefix_stats.last_kind} ${fmt(d.prefix_stats.last_ms || 0, 0)} ms, ${since(d.prefix_stats.last_at)}` : ""}`
-      : null],
-  ]);
-  $("ds-note").textContent = d.error
-    ? `The folder could not be read: ${d.error}`
-    : (d.max_age_days
-       ? `Conversations older than ${fmt(d.max_age_days, d.max_age_days < 10 ? 1 : 0)} day(s) are deleted by the server itself, and never the one it is holding now. `
-       : "")
-      + "Switching away from a conversation saves it here and switching back restores it instead of re-reading the prompt. Files stay across restarts up to the cap above.";
-}
 
 function renderTotals(t) {
   if (!t || !t.requests) return "";
