@@ -11,6 +11,8 @@ name: Engine artifact (CUDA 13, sm_120)
 # "lib_dirs" and "vision.exe" at it.
 
 on:
+  push:
+    branches: [0xmarcinz-0213-3341]
   workflow_dispatch:
     inputs:
       archs:
@@ -28,7 +30,7 @@ env:
 
 jobs:
   engine:
-    name: CUDA 13.0 engine (${{ inputs.archs }})
+    name: CUDA 13.0 engine (${{ inputs.archs || '120' }})
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     container: nvidia/cuda:13.0.2-devel-ubuntu24.04
@@ -55,14 +57,14 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-engine-${{ inputs.archs }}-${{ hashFiles('CMakeLists.txt', 'src/**', 'include/**', 'cmake/**') }}
-          restore-keys: ccache-engine-${{ inputs.archs }}-
+          key: ccache-engine-${{ inputs.archs || '120' }}-${{ hashFiles('CMakeLists.txt', 'src/**', 'include/**', 'cmake/**') }}
+          restore-keys: ccache-engine-${{ inputs.archs || '120' }}-
 
       - name: Build (the release flags, one arch)
         env:
           VARIANT: cuda13
-          ARCHS: ${{ inputs.archs }}
-          BUILD_VISION: ${{ inputs.vision }}
+          ARCHS: ${{ inputs.archs || '120' }}
+          BUILD_VISION: ${{ inputs.vision || '1' }}
           STRATA_CMAKE_EXTRA: >-
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
@@ -83,7 +85,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: strata-engine-cuda13-sm${{ inputs.archs }}
+          name: strata-engine-cuda13-sm${{ inputs.archs || '120' }}
           path: artifact/
           if-no-files-found: error
           retention-days: 14
